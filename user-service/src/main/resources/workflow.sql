@@ -125,3 +125,67 @@ VALUES
 
     -- Manager (CLOSED stage)
     (4, 'Manager', 9); -- Reopen
+--------------------------------------------------------------------------------------------
+
+-- 1. Insert into workflow_definition
+INSERT INTO workflow_manager.workflow_definition (workflow_id, project, module, code, name, description)
+VALUES (1, 'Copilot', 'RCSA', 'COPILOT_RCSA', 'Copilot RCSA Workflow', 'Workflow for Copilot RCSA module');
+
+-- 2. Insert into workflow_stage
+INSERT INTO workflow_manager.workflow_stage (stage_id, workflow_id, stage_order, code, name)
+VALUES 
+  (1, 1, 1, 'ASSESSMENT', 'Assessment Stage (BRM)'),
+  (2, 1, 2, 'REVIEW', 'Review Stage (PO)'),
+  (3, 1, 3, 'APPROVAL', 'Approval Stage (RFO)');
+
+-- 3. Insert into workflow_action
+INSERT INTO workflow_manager.workflow_action (action_id, stage_id, action, target_stage_id, is_terminal)
+VALUES 
+  -- Stage 1: Assessment
+  (1, 1, 'EDIT', 1, false),
+  (2, 1, 'SAVE', 1, false),
+  (3, 1, 'RESET', 1, false),
+  (4, 1, 'SUBMIT', 2, false),
+  (5, 1, 'CANCEL', NULL, true),
+
+  -- Stage 2: Review
+  (6, 2, 'REFER_BACK', 1, false),
+  (7, 2, 'RESET', 2, false),
+  (8, 2, 'SAVE', 2, false),
+  (9, 2, 'SUBMIT', 3, false),
+  (10, 2, 'CANCEL', NULL, true),
+
+  -- Stage 3: Approval
+  (11, 3, 'REFER_BACK', 2, false),
+  (12, 3, 'RESET', 3, false),
+  (13, 3, 'SAVE', 3, false),
+  (14, 3, 'SUBMIT', NULL, true),  -- Final submit → Closed
+  (15, 3, 'CANCEL', NULL, true);
+
+-- 4. Insert into workflow_stage_role_action
+-- Stage 1: BRM
+INSERT INTO workflow_manager.workflow_stage_role_action (role_action_id, stage_id, role, action_id)
+VALUES
+  (1, 1, 'BRM', 1),
+  (2, 1, 'BRM', 2),
+  (3, 1, 'BRM', 3),
+  (4, 1, 'BRM', 4),
+  (5, 1, 'BRM', 5);
+
+-- Stage 2: PO
+INSERT INTO workflow_manager.workflow_stage_role_action (role_action_id, stage_id, role, action_id)
+VALUES
+  (6, 2, 'PO', 6),
+  (7, 2, 'PO', 7),
+  (8, 2, 'PO', 8),
+  (9, 2, 'PO', 9),
+  (10, 2, 'PO', 10);
+
+-- Stage 3: RFO
+INSERT INTO workflow_manager.workflow_stage_role_action (role_action_id, stage_id, role, action_id)
+VALUES
+  (11, 3, 'RFO', 11),
+  (12, 3, 'RFO', 12),
+  (13, 3, 'RFO', 13),
+  (14, 3, 'RFO', 14),
+  (15, 3, 'RFO', 15);
