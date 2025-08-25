@@ -49,4 +49,85 @@ public List<ProcessManagement> findAllData() {
     return entityManager.createNativeQuery(sql, ProcessManagement.class).getResultList();
 }
 
-This returns only P1 – GROUP when P1 appears with India/Taiwan/Group; if no Group exists, you’ll get the newest active one for that process.
+This returns only P1 – GROUP when P1 appears with I
+
+ndia/Taiwan/Group; if no Group exists, you’ll 
+get the newest active one for that process.
+
+Yep—here are a few handy PostgreSQL checks.
+
+1) Processes that appear in 2+ countries (potentially groupable)
+
+SELECT LOWER(process_name) AS process_name_norm,
+       COUNT(*)                AS row_count,
+       COUNT(DISTINCT LOWER(country)) AS distinct_countries
+FROM sb_55313_116_drm.rcsa_udl_process_management
+GROUP BY LOWER(process_name)
+HAVING COUNT(DISTINCT LOWER(country)) > 1
+ORDER BY distinct_countries DESC, process_name_norm;
+
+2) Processes that have GROUP + at least one non-GROUP
+
+SELECT LOWER(process_name) AS process_name_norm,
+       BOOL_OR(LOWER(country)='group')              AS has_group,
+       BOOL_OR(LOWER(country)!='group')             AS has_non_group,
+       COUNT(*)                                     AS row_count,
+       COUNT(DISTINCT LOWER(country))               AS distinct_countries
+FROM sb_55313_116_drm.rcsa_udl_process_management
+GROUP BY LOWER(process_name)
+HAVING BOOL_OR(LOWER(country)='group') AND BOOL_OR(LOWER(country)!='group')
+ORDER BY process_name_norm;
+
+3) Detailed breakdown per process (country-wise counts)
+
+SELECT LOWER(process_name) AS process_name_norm,
+       LOWER(country)      AS country_norm,
+       COUNT(*)            AS rows_per_country
+FROM sb_55313_116_drm.rcsa_udl_process_management
+WHERE LOWER(process_name) IN (
+  SELECT LOWER(process_name)
+  FROM sb_55313_116_drm.rcsa_udl_process_management
+  GROUP BY LOWER(process_name)
+  HAVING COUNT(DISTINCT LOWER(country)) > 1
+)
+GROUP BY LOWER(process_name), LOWER(country)
+ORDER BY process_name_norm, country_norm;
+
+4) “What would be kept vs dropped” compared to your dedupe rule
+
+WITH ranked AS (
+  SELECT p.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY LOWER(p.process_name)
+           ORDER BY
+             CASE WHEN LOWER(p.country)='group' THEN 0 ELSE 1 END,
+             CASE WHEN LOWER(p.status)='active' THEN 0 ELSE 1 END,
+             p.modified_at DESC NULLS LAST,
+             p.process_id
+         ) AS rn
+  FROM sb_55313_116_drm.rcsa_udl_process_management p
+)
+SELECT
+  LOWER(process_name) AS process_name_norm,
+  process_id,
+  country,
+  status,
+  modified_at,
+  CASE WHEN rn=1 THEN 'KEPT' ELSE 'DROPPED' END AS selection
+FROM ranked
+WHERE LOWER(process_name) IN (
+  SELECT LOWER(process_name)
+  FROM sb_55313_116_drm.rcsa_udl_process_management
+  GROUP BY LOWER(process_name)
+  HAVING COUNT(DISTINCT LOWER(country)) > 1
+)
+ORDER BY process_name_norm, selection DESC, country;
+
+Optional index to speed these scans
+
+CREATE INDEX IF NOT EXISTS idx_procname_lower
+  ON sb_55313_116_drm.rcsa_udl_process_management (LOWER(process_name));
+CREATE INDEX IF NOT EXISTS idx_country_lower
+  ON sb_55313_116_drm.rcsa_udl_process_management (LOWER(country));
+
+Use (2) to see exactly where a GROUP row coexists with country-specific rows; (4) shows which one your dedupe query will keep and which will be hidden.
