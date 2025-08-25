@@ -1,0 +1,52 @@
+Perfect—use a single-row-per-process selection that prefers country='GROUP' (else the best non-group), then sort for display.
+
+PostgreSQL (drop-in for your repo)
+
+/* one row per process_name; prefer COUNTRY='GROUP' if present */
+WITH ranked AS (
+  SELECT
+    p.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY LOWER(p.process_name)
+      ORDER BY
+        CASE WHEN LOWER(p.country) = 'group' THEN 0 ELSE 1 END,   -- prefer GROUP
+        CASE WHEN LOWER(p.status)  = 'active' THEN 0 ELSE 1 END,  -- then ACTIVE
+        p.modified_at DESC NULLS LAST,                            -- newest first
+        p.process_id                                              -- stable tie-breaker
+    ) AS rn
+  FROM sb_55313_116_drm.rcsa_udl_process_management p
+)
+SELECT *
+FROM ranked
+WHERE rn = 1
+ORDER BY
+  CASE WHEN LOWER(status)='active' THEN 0 ELSE 1 END,
+  process_name ASC;
+
+Quarkus repository snippet
+
+public List<ProcessManagement> findAllData() {
+    String sql = """
+        WITH ranked AS (
+          SELECT p.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY LOWER(p.process_name)
+                   ORDER BY
+                     CASE WHEN LOWER(p.country) = 'group' THEN 0 ELSE 1 END,
+                     CASE WHEN LOWER(p.status)  = 'active' THEN 0 ELSE 1 END,
+                     p.modified_at DESC NULLS LAST,
+                     p.process_id
+                 ) AS rn
+          FROM sb_55313_116_drm.rcsa_udl_process_management p
+        )
+        SELECT * FROM ranked
+        WHERE rn = 1
+        ORDER BY
+          CASE WHEN LOWER(status)='active' THEN 0 ELSE 1 END,
+          process_name ASC
+        """;
+
+    return entityManager.createNativeQuery(sql, ProcessManagement.class).getResultList();
+}
+
+This returns only P1 – GROUP when P1 appears with India/Taiwan/Group; if no Group exists, you’ll get the newest active one for that process.
