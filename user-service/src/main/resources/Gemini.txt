@@ -1,0 +1,256 @@
+Gemini
+package com.example;
+
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.Properties;
+import java.sql.SQLException;
+
+public class DataProcessor {
+
+    public static void main(String[] args) {
+        // Load properties from the configuration file
+        Properties prop = new Properties();
+        try (FileInputStream fis = new FileInputStream("config.properties")) {
+            prop.load(fis);
+        } catch (IOException e) {
+            System.err.println("Could not read config.properties file. Ensure it's in the same directory as the program.");
+            e.printStackTrace();
+            return;
+        }
+
+        // Get the database and use case configurations from the properties file
+        String dbUrl = prop.getProperty("db.url");
+        String dbUser = prop.getProperty("db.user");
+        String dbPassword = prop.getProperty("db.password");
+        
+        String fetchSql = prop.getProperty("person.fetchSql");
+        String updateSql = prop.getProperty("person.updateSql");
+        String dtoClassName = prop.getProperty("person.dtoClass");
+        String primaryKeyColumn = prop.getProperty("person.primaryKeyColumn");
+
+        try {
+            // Create an instance of the generic processor
+            GenericDataProcessor genericProcessor = new GenericDataProcessor(
+                dbUrl, dbUser, dbPassword, fetchSql, updateSql, dtoClassName, primaryKeyColumn);
+
+            // Execute the processing logic
+            genericProcessor.processData();
+            System.out.println("Processing complete. All rows have been updated with JSON data.");
+
+        } catch (ClassNotFoundException e) {
+            System.err.println("Oracle JDBC driver not found or DTO class not found. Check your classpath and the config.properties file.");
+            e.printStackTrace();
+        } catch (SQLException e) {
+            System.err.println("Database connection or query failed.");
+            e.printStackTrace();
+        } catch (Exception e) {
+            System.err.println("An unexpected error occurred.");
+            e.printStackTrace();
+        }
+    }
+}
+--------------
+
+package com.example;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectWriter;
+import java.lang.reflect.Field;
+import java.sql.*;
+import java.util.Properties;
+import java.util.stream.Stream;
+
+import com.example.model.Address;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+public class GenericDataProcessor {
+
+    private final String dbUrl;
+    private final String dbUser;
+    private final String dbPassword;
+    private final String fetchSql;
+    private final String updateSql;
+    private final String dtoClassName;
+    private final String primaryKeyColumn;
+
+    public GenericDataProcessor(String dbUrl, String dbUser, String dbPassword, String fetchSql, String updateSql, String dtoClassName, String primaryKeyColumn) {
+        this.dbUrl = dbUrl;
+        this.dbUser = dbUser;
+        this.dbPassword = dbPassword;
+        this.fetchSql = fetchSql;
+        this.updateSql = updateSql;
+        this.dtoClassName = dtoClassName;
+        this.primaryKeyColumn = primaryKeyColumn;
+    }
+
+    /**
+     * Connects to the database, fetches data, generates JSON, and updates the table.
+     * This method uses reflection to handle any DTO class.
+     *
+     * @throws SQLException           if a database access error occurs.
+     * @throws ClassNotFoundException if the DTO class specified in the properties file is not found.
+     * @throws InstantiationException if the DTO class cannot be instantiated.
+     * @throws IllegalAccessException if the DTO class or its fields cannot be accessed.
+     */
+    public void processData() throws SQLException, ClassNotFoundException {
+        // Register the JDBC driver
+        Class.forName("oracle.jdbc.driver.OracleDriver");
+
+        // Use try-with-resources to ensure all resources are closed automatically.
+        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+             PreparedStatement pstmt = conn.prepareStatement(updateSql)) {
+
+            // Dynamically load the DTO class using reflection
+            Class<?> dtoClass = Class.forName(dtoClassName);
+            ObjectMapper objectMapper = new ObjectMapper();
+            ObjectWriter objectWriter = objectMapper.writerWithDefaultPrettyPrinter();
+
+            try (Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery(fetchSql)) {
+
+                // Get metadata about the columns in the ResultSet
+                ResultSetMetaData metaData = rs.getMetaData();
+                int columnCount = metaData.getColumnCount();
+
+                while (rs.next()) {
+                    // Create a new instance of the DTO
+                    Object dtoInstance = dtoClass.getConstructor().newInstance();
+
+                    // Map ResultSet columns to DTO fields using reflection
+                    for (int i = 1; i <= columnCount; i++) {
+                        String columnName = metaData.getColumnName(i);
+                        Object columnValue = rs.getObject(i);
+
+                        // Find the field in the DTO that corresponds to the column name
+                        for (Field field : dtoClass.getDeclaredFields()) {
+                            JsonProperty jsonProperty = field.getAnnotation(JsonProperty.class);
+                            String fieldName = (jsonProperty != null) ? jsonProperty.value() : field.getName();
+                            
+                            if (columnName.equalsIgnoreCase(fieldName)) {
+                                field.setAccessible(true);
+                                field.set(dtoInstance, columnValue);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Get the value of the primary key from the populated DTO using reflection
+                    Object primaryKeyValue = null;
+                    for (Field field : dtoClass.getDeclaredFields()) {
+                        JsonProperty jsonProperty = field.getAnnotation(JsonProperty.class);
+                        String fieldName = (jsonProperty != null) ? jsonProperty.value() : field.getName();
+
+                        if (primaryKeyColumn.equalsIgnoreCase(fieldName)) {
+                            field.setAccessible(true);
+                            primaryKeyValue = field.get(dtoInstance);
+                            break;
+                        }
+                    }
+
+                    // Generate JSON and update the database
+                    String jsonString = objectWriter.writeValueAsString(dtoInstance);
+                    System.out.println("Generated JSON for primary key " + primaryKeyValue + ":\n" + jsonString);
+
+                    pstmt.setString(1, jsonString);
+                    pstmt.setObject(2, primaryKeyValue);
+                    pstmt.executeUpdate();
+                    System.out.println("Updated row with primary key " + primaryKeyValue + " with JSON data.");
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Error during database operation: " + e.getMessage());
+            throw e;
+        } catch (Exception e) {
+            System.err.println("An unexpected error occurred during processing.");
+            e.printStackTrace();
+        }
+    }
+}
+--------------------
+
+package com.example.model;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+/**
+ * A Java Record for the Address DTO.
+ * Records are immutable and automatically generate a canonical constructor,
+ * accessors, equals(), and hashCode() methods, reducing boilerplate.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record Address(
+        @JsonProperty("street") String street,
+        @JsonProperty("city") String city,
+        @JsonProperty("zipCode") String zipCode
+) {}
+-----------------------------------------------------
+package com.example.model;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import java.util.List;
+
+/**
+ * A Java Record for the Person DTO.
+ * This record is designed to map directly from the flattened SQL query result.
+ * The business logic for phone vs. address is handled separately.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record PersonDTO(
+    @JsonProperty("USER_ID") String userId,
+    @JsonProperty("NAME") String name,
+    @JsonProperty("AGE") int age,
+    @JsonProperty("PHONE_NUMBERS") String phoneNumbers,
+    @JsonProperty("STREET") String street,
+    @JsonProperty("CITY") String city,
+    @JsonProperty("ZIP_CODE") String zipCode
+) {}
+----------------------------------
+<project xmlns="https://www.google.com/search?q=http://maven.apache.org/POM/4.0.0"
+xmlns:xsi="https://www.google.com/search?q=http://www.w3.org/2001/XMLSchema-instance"
+xsi:schemaLocation="https://www.google.com/search?q=http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+<modelVersion>4.0.0</modelVersion>
+
+<groupId>com.example</groupId>
+<artifactId>oracle-json-processor</artifactId>
+<version>1.0-SNAPSHOT</version>
+
+<properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+</properties>
+
+<dependencies>
+    <!-- Oracle JDBC Driver -->
+    <dependency>
+        <groupId>com.oracle.database.jdbc</groupId>
+        <artifactId>ojdbc8</artifactId>
+        <version>12.2.0.1</version>
+    </dependency>
+
+    <!-- Jackson for JSON processing -->
+    <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>2.13.0</version>
+    </dependency>
+</dependencies>
+
+<build>
+    <plugins>
+        <!-- Maven Compiler Plugin -->
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <version>3.8.1</version>
+            <configuration>
+                <source>${maven.compiler.source}</source>
+                <target>${maven.compiler.target}</target>
+            </configuration>
+        </plugin>
+    </plugins>
+</build>
+
+</project>

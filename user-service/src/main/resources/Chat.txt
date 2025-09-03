@@ -1,0 +1,919 @@
+Great question. The previous version was “example-first.” Below is a **generic, property-driven engine** you can point at **any query + DTO pair** from a YAML config. It:
+
+* Reads a **use-case** from `application.yaml` (or a file path you pass).
+* Executes the **SELECT** you provide.
+* Maps each row to **any DTO class** via **annotations** (no hand-written mapping).
+* Serializes to JSON (Jackson).
+* **Updates** your table using your **UPDATE** statement (JSON + PK placeholders).
+* Batching, dry-run, fetch size, etc.
+
+You only write:
+
+1. SQL that already applies your “business conditions,” and
+2. a DTO class annotated with how columns map to fields.
+
+---
+
+# 📦 Project layout
+
+```
+json-updater/
+├─ pom.xml
+├─ src/main/resources/application.yaml
+└─ src/main/java/com/example/jsonupdater/
+   ├─ Main.java
+   ├─ config/
+   │  ├─ AppConfig.java
+   │  ├─ UseCaseConfig.java
+   │  └─ YamlLoader.java
+   ├─ db/Db.java
+   ├─ engine/JobRunner.java
+   ├─ mapping/
+   │  ├─ ResultSetMapper.java
+   │  ├─ TypeCoercions.java
+   │  └─ annotations/
+   │     ├─ RsField.java
+   │     ├─ Nested.java
+   │     └─ DelimitedList.java
+   └─ model/
+      ├─ PersonDto.java
+      └─ Address.java
+```
+
+---
+
+# 🧱 `pom.xml`
+
+```xml
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example</groupId>
+  <artifactId>json-updater</artifactId>
+  <version>2.0.0</version>
+  <name>Generic Oracle JSON Updater</name>
+
+  <properties>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <jackson.version>2.17.2</jackson.version>
+    <slf4j.version>2.0.13</slf4j.version>
+    <ojdbc.version>23.5.0.24.07</ojdbc.version>
+    <snakeyaml.version>2.2</snakeyaml.version>
+  </properties>
+
+  <dependencies>
+    <!-- Oracle JDBC (use ojdbc8 if your repo lacks ojdbc11) -->
+    <dependency>
+      <groupId>com.oracle.database.jdbc</groupId>
+      <artifactId>ojdbc11</artifactId>
+      <version>${ojdbc.version}</version>
+    </dependency>
+
+    <!-- Jackson -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-annotations</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <!-- YAML config -->
+    <dependency>
+      <groupId>org.snakeyaml</groupId>
+      <artifactId>snakeyaml-engine</artifactId>
+      <version>${snakeyaml.version}</version>
+    </dependency>
+
+    <!-- Logging -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>${slf4j.version}</version>
+      <scope>runtime</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.example.jsonupdater.Main</mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <release>17</release>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+```
+
+---
+
+# ⚙️ `src/main/resources/application.yaml`
+
+> You can keep multiple use-cases here. Each use-case provides: a **name**, a **selectSql**, an **updateSql**, the **dtoClass**, and the **pkColumn** name from your SELECT.
+
+```yaml
+db:
+  url: "jdbc:oracle:thin:@//HOST:1521/ORCLPDB1"
+  user: "APPUSER"
+  password: "SECRET"
+
+defaults:
+  fetchSize: 500
+  batchSize: 200
+  dryRun: false
+
+useCases:
+  - name: "person"
+    dtoClass: "com.example.jsonupdater.model.PersonDto"
+    pkColumn: "PK"                   # must be present in SELECT
+    selectSql: |
+      SELECT
+        p.ID AS PK,
+        p.NAME,
+        p.AGE,
+        /* business rules in SQL: build a CSV or null */
+        CASE WHEN p.PHONE1 IS NULL AND p.PHONE2 IS NULL
+             THEN NULL
+             ELSE REGEXP_REPLACE(NVL(p.PHONE1,'')||','||NVL(p.PHONE2,''), '^,|,$', '')
+        END AS PHONE_CSV,
+        p.STREET,
+        p.CITY,
+        p.ZIPCODE
+      FROM PERSONS p
+      WHERE p.PROFILE_JSON IS NULL OR DBMS_LOB.GETLENGTH(p.PROFILE_JSON) = 0
+
+    updateSql: |
+      UPDATE PERSONS SET PROFILE_JSON = ? WHERE ID = ?
+    # by convention param 1 is JSON, param 2 is PK (from pkColumn)
+```
+
+> Want many use-cases? Copy/paste a block, change `name`, `dtoClass`, SQL, and `pkColumn`.
+
+---
+
+# 🏁 `Main.java`
+
+```java
+package com.example.jsonupdater;
+
+import com.example.jsonupdater.config.AppConfig;
+import com.example.jsonupdater.config.UseCaseConfig;
+import com.example.jsonupdater.config.YamlLoader;
+import com.example.jsonupdater.db.Db;
+import com.example.jsonupdater.engine.JobRunner;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.util.Map;
+
+public class Main {
+    private static final Logger log = LoggerFactory.getLogger(Main.class);
+
+    public static void main(String[] args) throws Exception {
+        Map<String, String> cli = Args.parse(args);
+
+        String useCaseName = cli.getOrDefault("use-case", System.getenv().getOrDefault("USE_CASE", "person"));
+        String cfgPath = cli.getOrDefault("config", System.getenv().getOrDefault("APP_CONFIG", "")); // optional
+
+        AppConfig config = (cfgPath == null || cfgPath.isBlank())
+                ? YamlLoader.loadFromResource("/application.yaml")
+                : YamlLoader.loadFromFile(Path.of(cfgPath));
+
+        // CLI overrides
+        config.getDefaults().setDryRun(Boolean.parseBoolean(cli.getOrDefault("dry-run",
+                Boolean.toString(config.getDefaults().isDryRun()))));
+        config.getDefaults().setFetchSize(Integer.parseInt(cli.getOrDefault("fetch-size",
+                Integer.toString(config.getDefaults().getFetchSize()))));
+        config.getDefaults().setBatchSize(Integer.parseInt(cli.getOrDefault("batch-size",
+                Integer.toString(config.getDefaults().getBatchSize()))));
+
+        UseCaseConfig uc = config.findUseCase(useCaseName);
+        if (uc == null) {
+            log.error("Use-case '{}' not found in config.", useCaseName);
+            System.exit(2);
+        }
+
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        mapper.setSerializationInclusion(JsonInclude.Include.NON_NULL);
+
+        try (Connection conn = Db.connect(config)) {
+            conn.setAutoCommit(false);
+            new JobRunner(mapper).run(conn, config, uc);
+            if (config.getDefaults().isDryRun()) {
+                log.info("Dry-run -> rollback");
+                conn.rollback();
+            } else {
+                conn.commit();
+                log.info("Committed.");
+            }
+        }
+    }
+
+    // tiny arg parser
+    static final class Args {
+        static Map<String, String> parse(String[] args) {
+            return java.util.Arrays.stream(args)
+                    .filter(a -> a.startsWith("--"))
+                    .map(a -> {
+                        int i = a.indexOf('=');
+                        if (i > 2) return Map.entry(a.substring(2, i), a.substring(i + 1));
+                        return Map.entry(a.substring(2), "true");
+                    })
+                    .collect(java.util.stream.Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (a,b)->b));
+        }
+    }
+}
+```
+
+---
+
+# ⚙️ Config classes
+
+## `config/AppConfig.java`
+
+```java
+package com.example.jsonupdater.config;
+
+import java.util.List;
+
+public class AppConfig {
+    public static class Db {
+        private String url;
+        private String user;
+        private String password;
+        public String getUrl() { return url; }
+        public void setUrl(String url) { this.url = url; }
+        public String getUser() { return user; }
+        public void setUser(String user) { this.user = user; }
+        public String getPassword() { return password; }
+        public void setPassword(String password) { this.password = password; }
+    }
+
+    public static class Defaults {
+        private int fetchSize = 500;
+        private int batchSize = 200;
+        private boolean dryRun = false;
+        public int getFetchSize() { return fetchSize; }
+        public void setFetchSize(int fetchSize) { this.fetchSize = fetchSize; }
+        public int getBatchSize() { return batchSize; }
+        public void setBatchSize(int batchSize) { this.batchSize = batchSize; }
+        public boolean isDryRun() { return dryRun; }
+        public void setDryRun(boolean dryRun) { this.dryRun = dryRun; }
+    }
+
+    private Db db;
+    private Defaults defaults = new Defaults();
+    private List<UseCaseConfig> useCases;
+
+    public Db getDb() { return db; }
+    public void setDb(Db db) { this.db = db; }
+    public Defaults getDefaults() { return defaults; }
+    public void setDefaults(Defaults defaults) { this.defaults = defaults; }
+    public List<UseCaseConfig> getUseCases() { return useCases; }
+    public void setUseCases(List<UseCaseConfig> useCases) { this.useCases = useCases; }
+
+    public UseCaseConfig findUseCase(String name) {
+        if (useCases == null) return null;
+        return useCases.stream().filter(u -> name.equalsIgnoreCase(u.getName())).findFirst().orElse(null);
+    }
+}
+```
+
+## `config/UseCaseConfig.java`
+
+```java
+package com.example.jsonupdater.config;
+
+public class UseCaseConfig {
+    private String name;
+    private String dtoClass;
+    private String pkColumn;
+    private String selectSql;
+    private String updateSql;
+
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getDtoClass() { return dtoClass; }
+    public void setDtoClass(String dtoClass) { this.dtoClass = dtoClass; }
+    public String getPkColumn() { return pkColumn; }
+    public void setPkColumn(String pkColumn) { this.pkColumn = pkColumn; }
+    public String getSelectSql() { return selectSql; }
+    public void setSelectSql(String selectSql) { this.selectSql = selectSql; }
+    public String getUpdateSql() { return updateSql; }
+    public void setUpdateSql(String updateSql) { this.updateSql = updateSql; }
+}
+```
+
+## `config/YamlLoader.java`
+
+```java
+package com.example.jsonupdater.config;
+
+import org.snakeyaml.engine.v2.api.Load;
+import org.snakeyaml.engine.v2.api.LoadSettings;
+
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
+
+public class YamlLoader {
+
+    public static AppConfig loadFromResource(String resourcePath) {
+        try (InputStream is = YamlLoader.class.getResourceAsStream(resourcePath)) {
+            if (is == null) throw new IllegalArgumentException("Resource not found: " + resourcePath);
+            return toConfig(is);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load YAML resource", e);
+        }
+    }
+
+    public static AppConfig loadFromFile(Path path) {
+        try (InputStream is = Files.newInputStream(path)) {
+            return toConfig(is);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to load YAML file: " + path, e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static AppConfig toConfig(InputStream is) {
+        Load loader = new Load(LoadSettings.builder().build());
+        Object root = loader.loadFromInputStream(is);
+        Map<String, Object> map = (Map<String, Object>) root;
+        return Mapper.map(map);
+    }
+
+    /* Light manual mapping to avoid extra libs */
+    @SuppressWarnings("unchecked")
+    private static class Mapper {
+        static AppConfig map(Map<String, Object> m) {
+            AppConfig cfg = new AppConfig();
+
+            Map<String, Object> db = (Map<String, Object>) m.get("db");
+            if (db != null) {
+                AppConfig.Db d = new AppConfig.Db();
+                d.setUrl((String) db.get("url"));
+                d.setUser((String) db.get("user"));
+                d.setPassword((String) db.get("password"));
+                cfg.setDb(d);
+            }
+
+            Map<String, Object> def = (Map<String, Object>) m.get("defaults");
+            if (def != null) {
+                AppConfig.Defaults d = new AppConfig.Defaults();
+                if (def.get("fetchSize") != null) d.setFetchSize(((Number) def.get("fetchSize")).intValue());
+                if (def.get("batchSize") != null) d.setBatchSize(((Number) def.get("batchSize")).intValue());
+                if (def.get("dryRun") != null) d.setDryRun(Boolean.parseBoolean(def.get("dryRun").toString()));
+                cfg.setDefaults(d);
+            }
+
+            var list = (java.util.List<Map<String, Object>>) m.get("useCases");
+            if (list != null) {
+                java.util.List<UseCaseConfig> ucs = new java.util.ArrayList<>();
+                for (Map<String, Object> u : list) {
+                    UseCaseConfig uc = new UseCaseConfig();
+                    uc.setName((String) u.get("name"));
+                    uc.setDtoClass((String) u.get("dtoClass"));
+                    uc.setPkColumn((String) u.get("pkColumn"));
+                    uc.setSelectSql((String) u.get("selectSql"));
+                    uc.setUpdateSql((String) u.get("updateSql"));
+                    ucs.add(uc);
+                }
+                cfg.setUseCases(ucs);
+            }
+
+            return cfg;
+        }
+    }
+}
+```
+
+---
+
+# 🗄️ `db/Db.java`
+
+```java
+package com.example.jsonupdater.db;
+
+import com.example.jsonupdater.config.AppConfig;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.util.Properties;
+
+public class Db {
+    public static Connection connect(AppConfig cfg) throws Exception {
+        Properties p = new Properties();
+        p.setProperty("user", cfg.getDb().getUser());
+        p.setProperty("password", cfg.getDb().getPassword());
+        // p.setProperty("defaultRowPrefetch", "200");
+        return DriverManager.getConnection(cfg.getDb().getUrl(), p);
+    }
+}
+```
+
+---
+
+# 🚀 Engine
+
+## `engine/JobRunner.java`
+
+```java
+package com.example.jsonupdater.engine;
+
+import com.example.jsonupdater.config.AppConfig;
+import com.example.jsonupdater.config.UseCaseConfig;
+import com.example.jsonupdater.mapping.ResultSetMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.Constructor;
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class JobRunner {
+    private static final Logger log = LoggerFactory.getLogger(JobRunner.class);
+    private final ObjectMapper mapper;
+
+    public JobRunner(ObjectMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    public void run(Connection conn, AppConfig app, UseCaseConfig uc) throws Exception {
+        Class<?> dtoClass = Class.forName(uc.getDtoClass());
+        Constructor<?> ctor = dtoClass.getDeclaredConstructor();
+        ctor.setAccessible(true);
+
+        int fetchSize = app.getDefaults().getFetchSize();
+        int batchSize = app.getDefaults().getBatchSize();
+        boolean dryRun = app.getDefaults().isDryRun();
+
+        String pkCol = uc.getPkColumn();
+
+        int scanned = 0, updated = 0, batched = 0;
+
+        try (PreparedStatement ps = conn.prepareStatement(uc.getSelectSql(),
+                ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+             PreparedStatement upd = conn.prepareStatement(uc.getUpdateSql())) {
+
+            ps.setFetchSize(fetchSize);
+
+            try (ResultSet rs = ps.executeQuery()) {
+                ResultSetMapper rsm = new ResultSetMapper();
+
+                while (rs.next()) {
+                    scanned++;
+
+                    Object dto = rsm.mapRow(rs, dtoClass);
+                    String json = mapper.writeValueAsString(dto);
+
+                    Object pk = rs.getObject(pkCol);
+                    if (pk == null) {
+                        log.warn("Row has null PK (column '{}'), skipping.", pkCol);
+                        continue;
+                    }
+
+                    if (dryRun) {
+                        if (updated < 5) {
+                            log.info("DRY-RUN pk={} json={}", pk, json);
+                        }
+                        updated++;
+                        continue;
+                    }
+
+                    // convention: param #1 = JSON, param #2 = PK
+                    upd.setString(1, json);
+                    if (pk instanceof Number) {
+                        upd.setLong(2, ((Number) pk).longValue());
+                    } else {
+                        upd.setObject(2, pk);
+                    }
+                    upd.addBatch();
+                    batched++;
+
+                    if (batched >= batchSize) {
+                        updated += sum(upd.executeBatch());
+                        conn.commit();
+                        log.info("Committed batch; total updated so far={}", updated);
+                        batched = 0;
+                    }
+                }
+
+                if (!dryRun && batched > 0) {
+                    updated += sum(upd.executeBatch());
+                }
+            }
+        }
+
+        log.info("UseCase='{}' scanned={} {}={}",
+                uc.getName(), scanned,
+                dryRun ? "wouldUpdate" : "updated", updated);
+    }
+
+    private static int sum(int[] arr) {
+        int n = 0; for (int x : arr) if (x > 0) n += x; return n;
+    }
+}
+```
+
+---
+
+# 🔧 Mapping Annotations + Mapper
+
+## `mapping/annotations/RsField.java`
+
+```java
+package com.example.jsonupdater.mapping.annotations;
+
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.FIELD)
+public @interface RsField {
+    /** Column name in ResultSet (case-insensitive). */
+    String value();
+}
+```
+
+## `mapping/annotations/Nested.java`
+
+```java
+package com.example.jsonupdater.mapping.annotations;
+
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.FIELD)
+public @interface Nested {
+    /**
+     * Prefix for columns belonging to this nested object.
+     * Example: prefix = "ADDR_", maps ADDR_STREET -> street, ADDR_CITY -> city, etc.
+     */
+    String prefix();
+}
+```
+
+## `mapping/annotations/DelimitedList.java`
+
+```java
+package com.example.jsonupdater.mapping.annotations;
+
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.FIELD)
+public @interface DelimitedList {
+    String column();          // column holding a single string like "a,b,c"
+    String delimiter() default ","; // delimiter to split on
+    boolean trimValues() default true;
+    boolean skipEmpty() default true;
+}
+```
+
+## `mapping/TypeCoercions.java`
+
+```java
+package com.example.jsonupdater.mapping;
+
+import java.math.BigDecimal;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.*;
+import java.util.Date;
+
+public final class TypeCoercions {
+    private TypeCoercions() {}
+
+    public static Object getColumn(ResultSet rs, String column, Class<?> target) throws SQLException {
+        if (target == String.class) {
+            return rs.getString(column);
+        } else if (target == Integer.class || target == int.class) {
+            int v = rs.getInt(column); return rs.wasNull() && target == Integer.class ? null : v;
+        } else if (target == Long.class || target == long.class) {
+            long v = rs.getLong(column); return rs.wasNull() && target == Long.class ? null : v;
+        } else if (target == Double.class || target == double.class) {
+            double v = rs.getDouble(column); return rs.wasNull() && target == Double.class ? null : v;
+        } else if (target == BigDecimal.class) {
+            return rs.getBigDecimal(column);
+        } else if (target == Boolean.class || target == boolean.class) {
+            boolean v = rs.getBoolean(column); return rs.wasNull() && target == Boolean.class ? null : v;
+        } else if (target == java.sql.Date.class) {
+            return rs.getDate(column);
+        } else if (target == java.sql.Timestamp.class) {
+            return rs.getTimestamp(column);
+        } else if (target == LocalDate.class) {
+            var ts = rs.getDate(column);
+            return ts == null ? null : ts.toLocalDate();
+        } else if (target == LocalDateTime.class) {
+            var ts = rs.getTimestamp(column);
+            return ts == null ? null : ts.toLocalDateTime();
+        } else if (target == OffsetDateTime.class) {
+            var ts = rs.getTimestamp(column);
+            return ts == null ? null : ts.toInstant().atOffset(ZoneOffset.UTC);
+        } else {
+            // fallback:
+            return rs.getObject(column);
+        }
+    }
+}
+```
+
+## `mapping/ResultSetMapper.java`
+
+```java
+package com.example.jsonupdater.mapping;
+
+import com.example.jsonupdater.mapping.annotations.DelimitedList;
+import com.example.jsonupdater.mapping.annotations.Nested;
+import com.example.jsonupdater.mapping.annotations.RsField;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.util.*;
+
+public class ResultSetMapper {
+
+    public <T> T mapRow(ResultSet rs, Class<T> dtoClass) throws Exception {
+        T instance = newInstance(dtoClass);
+
+        Map<String, Integer> index = buildIndex(rs);
+
+        for (Field f : dtoClass.getDeclaredFields()) {
+            f.setAccessible(true);
+
+            // nested object with prefix
+            Nested nested = f.getAnnotation(Nested.class);
+            if (nested != null) {
+                Object nestedObj = mapNested(rs, f.getType(), nested.prefix(), index);
+                f.set(instance, nestedObj);
+                continue;
+            }
+
+            // delimited list mapping
+            DelimitedList dl = f.getAnnotation(DelimitedList.class);
+            if (dl != null) {
+                String raw = getString(rs, dl.column(), index);
+                if (raw == null || raw.isBlank()) {
+                    f.set(instance, null);
+                } else {
+                    String[] parts = raw.split(dl.delimiter(), -1);
+                    List<String> out = new ArrayList<>(parts.length);
+                    for (String p : parts) {
+                        String v = dl.trimValues() ? p.trim() : p;
+                        if (dl.skipEmpty() && v.isEmpty()) continue;
+                        out.add(v);
+                    }
+                    f.set(instance, out);
+                }
+                continue;
+            }
+
+            // simple RsField column
+            RsField col = f.getAnnotation(RsField.class);
+            if (col != null) {
+                String c = col.value();
+                if (!index.containsKey(c.toUpperCase(Locale.ROOT))) {
+                    // ignore missing columns (lets you reuse DTOs)
+                    continue;
+                }
+                Object v = TypeCoercions.getColumn(rs, c, f.getType());
+                f.set(instance, v);
+            }
+        }
+
+        return instance;
+    }
+
+    private Object mapNested(ResultSet rs, Class<?> nestedType, String prefix, Map<String,Integer> idx) throws Exception {
+        Object nested = newInstance(nestedType);
+        boolean anySet = false;
+
+        for (Field nf : nestedType.getDeclaredFields()) {
+            nf.setAccessible(true);
+            String colName = prefix + nf.getName().toUpperCase(Locale.ROOT); // default: PREFIX_fieldName
+            // Allow overriding with RsField inside nested
+            RsField rf = nf.getAnnotation(RsField.class);
+            if (rf != null) colName = rf.value();
+
+            if (!idx.containsKey(colName.toUpperCase(Locale.ROOT))) continue;
+
+            Object v = TypeCoercions.getColumn(rs, colName, nf.getType());
+            if (v != null) {
+                nf.set(nested, v);
+                anySet = true;
+            }
+        }
+
+        return anySet ? nested : null;
+    }
+
+    private static Map<String,Integer> buildIndex(ResultSet rs) throws Exception {
+        ResultSetMetaData md = rs.getMetaData();
+        Map<String,Integer> map = new HashMap<>();
+        for (int i = 1; i <= md.getColumnCount(); i++) {
+            map.put(md.getColumnLabel(i).toUpperCase(Locale.ROOT), i);
+        }
+        return map;
+    }
+
+    private static String getString(ResultSet rs, String column, Map<String,Integer> idx) throws Exception {
+        Integer i = idx.get(column.toUpperCase(Locale.ROOT));
+        if (i == null) return null;
+        return rs.getString(i);
+    }
+
+    private static <T> T newInstance(Class<T> c) throws Exception {
+        Constructor<T> ctor = c.getDeclaredConstructor();
+        ctor.setAccessible(true);
+        return ctor.newInstance();
+    }
+}
+```
+
+---
+
+# 🧩 Example DTOs (showing how generic mapping works)
+
+## `model/Address.java`
+
+```java
+package com.example.jsonupdater.model;
+
+public class Address {
+    // The mapper will look for columns ADDR_STREET, ADDR_CITY, ADDR_ZIPCODE
+    private String street;
+    private String city;
+    private String zipCode;
+
+    public String getStreet() { return street; }
+    public void setStreet(String street) { this.street = street; }
+    public String getCity() { return city; }
+    public void setCity(String city) { this.city = city; }
+    public String getZipCode() { return zipCode; }
+    public void setZipCode(String zipCode) { this.zipCode = zipCode; }
+}
+```
+
+## `model/PersonDto.java`
+
+```java
+package com.example.jsonupdater.model;
+
+import com.example.jsonupdater.mapping.annotations.DelimitedList;
+import com.example.jsonupdater.mapping.annotations.Nested;
+import com.example.jsonupdater.mapping.annotations.RsField;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonPropertyOrder;
+
+import java.util.List;
+
+@JsonInclude(JsonInclude.Include.NON_NULL)
+@JsonPropertyOrder({"name","age","phone","address"})
+public class PersonDto {
+
+    @RsField("NAME")
+    private String name;
+
+    @RsField("AGE")
+    private Integer age;
+
+    // PHONE_CSV column -> ["123456","567899"]
+    @DelimitedList(column = "PHONE_CSV", delimiter = ",", trimValues = true, skipEmpty = true)
+    private List<String> phone;
+
+    // Will read ADDR_STREET, ADDR_CITY, ADDR_ZIPCODE by default (prefix + fieldName)
+    @Nested(prefix = "ADDR_")
+    private Address address;
+
+    public String getName() { return name; }
+    public Integer getAge() { return age; }
+    public List<String> getPhone() { return phone; }
+    public Address getAddress() { return address; }
+
+    public void setName(String name) { this.name = name; }
+    public void setAge(Integer age) { this.age = age; }
+    public void setPhone(List<String> phone) { this.phone = phone; }
+    public void setAddress(Address address) { this.address = address; }
+}
+```
+
+> **How do we apply the “business condition” (phone vs address)?**
+> Put it in SQL. E.g., if no phone exists, return `PHONE_CSV = NULL` **and** return address columns as `ADDR_STREET`, `ADDR_CITY`, `ADDR_ZIPCODE`; if phone exists, you can still return address columns as `NULL`. Because of `@JsonInclude.NON_NULL`, fields that are `null` won’t appear in the JSON.
+> This keeps the engine generic.
+
+You can also override nested column names by putting `@RsField("ADDR_STREET")` on fields inside `Address` if you don’t want the prefix convention.
+
+---
+
+# ▶️ Build & Run
+
+**Build:**
+
+```bash
+mvn -q -U -DskipTests package
+```
+
+**Run using default `application.yaml` in resources:**
+
+```bash
+java -jar target/json-updater-2.0.0-shaded.jar --use-case=person
+```
+
+**Run with an external config file:**
+
+```bash
+java -jar target/json-updater-2.0.0-shaded.jar \
+  --use-case=person \
+  --config=/path/to/application.yaml \
+  --dry-run=true \
+  --fetch-size=1000 \
+  --batch-size=500
+```
+
+---
+
+# ✅ How this answers your asks
+
+* **Generic core logic**: `JobRunner` + `ResultSetMapper` handle any DTO via reflection/annotations.
+* **Property-driven**: `application.yaml` defines the **query**, **DTO**, **PK**, and **update SQL**.
+* **Business conditions**: push into SQL; the mapper is agnostic and only maps columns to fields.
+* **Update by primary key**: `pkColumn` identifies the PK from your SELECT; engine binds JSON (param 1) + PK (param 2) to your `updateSql`.
+* **Reusable across teams**: add new use-cases without changing engine code — just new DTO + YAML block.
+
+---
+
+# 🧪 Example SQL patterns for your conditions
+
+* Make phone optional:
+
+  ```sql
+  CASE WHEN phone1 IS NULL AND phone2 IS NULL THEN NULL
+       ELSE REGEXP_REPLACE(NVL(phone1,'')||','||NVL(phone2,''), '^,|,$', '')
+  END AS PHONE_CSV
+  ```
+* Provide address only when `PHONE_CSV IS NULL`:
+
+  ```sql
+  CASE WHEN (phone1 IS NULL AND phone2 IS NULL) THEN street END AS ADDR_STREET,
+  CASE WHEN (phone1 IS NULL AND phone2 IS NULL) THEN city   END AS ADDR_CITY,
+  CASE WHEN (phone1 IS NULL AND phone2 IS NULL) THEN zipcode END AS ADDR_ZIPCODE
+  ```
+
+Because of `@JsonInclude.NON_NULL`, **only** the populated branch shows up in JSON.
+
+---
+
+If you want, share one of your **real DTOs** and a sample **SELECT**; I’ll craft the exact YAML + DTO annotations so it drops in and runs.
